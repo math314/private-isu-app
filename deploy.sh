@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 ssh shanai-isucon-app-01 "rm -r /tmp/etc"
 ssh shanai-isucon-app-01 "mkdir -p /tmp/etc/nginx && mkdir -p /tmp/etc/mysql"
 
@@ -16,5 +17,8 @@ ssh shanai-isucon-app-01 "sudo systemctl stop isu-go.service"
 
 scp app/src/app shanai-isucon-app-01:/home/isucon/private_isu/webapp/golang
 scp -r app/src/templates shanai-isucon-app-01:/home/isucon/private_isu/webapp/golang
+
+ssh shanai-isucon-app-01 "sudo systemctl restart nginx.service"
+ssh shanai-isucon-app-01 "sudo systemctl restart mysql.service"
 
 ssh shanai-isucon-app-01 "sudo systemctl start isu-go.service"

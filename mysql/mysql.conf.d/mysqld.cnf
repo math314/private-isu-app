@@ -104,3 +104,7 @@ max_binlog_size   = 100M
 # ssl-key=/etc/mysql/server-key.pem
 
 skip-grant-tables
+
+slow_query_log                = 1
+slow_query_log_file           = /tmp/mysqld-slow.log
+long_query_time               = 0
