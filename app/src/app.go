@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"mdb"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,18 +19,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
-	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 	"github.com/zenazn/goji"
 	"github.com/zenazn/goji/web"
+
+	_ "net/http/pprof"
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db           *sqlx.DB
+	store        *sessions.CookieStore
+	userStore    *mdb.UserStore
+	commentStore *mdb.CommentStore
 )
 
 const (
@@ -41,40 +44,37 @@ const (
 	StatusUnprocessableEntity = 422
 )
 
-type User struct {
-	ID          int       `db:"id"`
-	AccountName string    `db:"account_name"`
-	Passhash    string    `db:"passhash"`
-	Authority   int       `db:"authority"`
-	DelFlg      int       `db:"del_flg"`
-	CreatedAt   time.Time `db:"created_at"`
-}
-
 type Post struct {
 	ID           int       `db:"id"`
 	UserID       int       `db:"user_id"`
-	Imgdata      []byte    `db:"imgdata"`
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
-	User         User
+	User         *mdb.User
 	CSRFToken    string
 }
 
 type Comment struct {
-	ID        int       `db:"id"`
-	PostID    int       `db:"post_id"`
-	UserID    int       `db:"user_id"`
-	Comment   string    `db:"comment"`
-	CreatedAt time.Time `db:"created_at"`
-	User      User
+	mdb.Comment
+	User *mdb.User
 }
 
 func init() {
-	memcacheClient := memcache.New("localhost:11211")
-	store = gsm.NewMemcacheStore(memcacheClient, "isucogram_", []byte("sendagaya"))
+	store = sessions.NewCookieStore([]byte("isu-app-session"))
+}
+
+func initMdbs() {
+	if userStore != nil {
+		userStore.Close()
+	}
+	userStore = mdb.NewUserStore(db)
+
+	if commentStore != nil {
+		commentStore.Close()
+	}
+	commentStore = mdb.NewCommentStore(db)
 }
 
 func dbInitialize() {
@@ -89,19 +89,17 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+	initMdbs()
 }
 
-func tryLogin(accountName, password string) *User {
-	u := User{}
-	err := db.Get(&u, "SELECT * FROM users WHERE account_name = ? AND del_flg = 0", accountName)
+func tryLogin(accountName, password string) *mdb.User {
+	u, err := userStore.SelectFromName(accountName)
 	if err != nil {
 		return nil
 	}
 
-	if &u != nil && calculatePasshash(u.AccountName, password) == u.Passhash {
-		return &u
-	} else if &u == nil {
-		return nil
+	if calculatePasshash(u.AccountName, password) == u.Passhash {
+		return u
 	} else {
 		return nil
 	}
@@ -148,18 +146,18 @@ func getSession(r *http.Request) *sessions.Session {
 	return session
 }
 
-func getSessionUser(r *http.Request) User {
+func getSessionUser(r *http.Request) *mdb.User {
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
 	if !ok || uid == nil {
-		return User{}
+		return nil
 	}
 
-	u := User{}
-
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	val, _ := uid.(int)
+	u, err := userStore.SelectFromId(val)
 	if err != nil {
-		return User{}
+		log.Print(err)
+		return nil
 	}
 
 	return u
@@ -182,23 +180,23 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		p.CommentCount = commentStore.SelectCountWherePostId(p.ID)
+
+		limit := -1
+		if !allComments {
+			limit = 3
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
+		oriComments := commentStore.SelectCommentOrderByCreatedAt(p.ID, limit)
+
 		var comments []Comment
-		cerr := db.Select(&comments, query, p.ID)
-		if cerr != nil {
-			return nil, cerr
+		for _, oc := range oriComments {
+			comments = append(comments, Comment{Comment: *oc})
 		}
 
 		for i := 0; i < len(comments); i++ {
-			uerr := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			var uerr error
+			comments[i].User, uerr = userStore.SelectFromId(comments[i].UserID)
 			if uerr != nil {
 				return nil, uerr
 			}
@@ -210,8 +208,9 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 		}
 
 		p.Comments = comments
+		var perr error
 
-		perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		p.User, perr = userStore.SelectFromId(p.UserID)
 		if perr != nil {
 			return nil, perr
 		}
@@ -242,8 +241,8 @@ func imageURL(p Post) string {
 	return "/image/" + strconv.Itoa(p.ID) + ext
 }
 
-func isLogin(u User) bool {
-	return u.ID != 0
+func isLogin(u *mdb.User) bool {
+	return u != nil
 }
 
 func getCSRFToken(r *http.Request) string {
@@ -284,7 +283,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		getTemplPath("layout.html"),
 		getTemplPath("login.html")),
 	).Execute(w, struct {
-		Me    User
+		Me    *mdb.User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
 }
@@ -323,9 +322,9 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		getTemplPath("layout.html"),
 		getTemplPath("register.html")),
 	).Execute(w, struct {
-		Me    User
+		Me    *mdb.User
 		Flash string
-	}{User{}, getFlash(w, r, "notice")})
+	}{nil, getFlash(w, r, "notice")})
 }
 
 func postRegister(w http.ResponseWriter, r *http.Request) {
@@ -346,11 +345,10 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exists := 0
 	// ユーザーが存在しない場合はエラーになるのでエラーチェックはしない
-	db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
+	_, err := userStore.SelectFromName(accountName)
 
-	if exists == 1 {
+	if err == nil {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名がすでに使われています"
 		session.Save(r, w)
@@ -359,19 +357,13 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, eerr := db.Exec(query, accountName, calculatePasshash(accountName, password))
+	uid, eerr := userStore.Insert(accountName, calculatePasshash(accountName, password))
 	if eerr != nil {
 		fmt.Println(eerr.Error())
 		return
 	}
 
 	session := getSession(r)
-	uid, lerr := result.LastInsertId()
-	if lerr != nil {
-		fmt.Println(lerr.Error())
-		return
-	}
 	session.Values["user_id"] = uid
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
@@ -402,7 +394,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 20")
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -414,24 +406,22 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	indexCache.Execute(w, struct {
+	err = indexCache.Execute(w, struct {
 		Posts     []Post
-		Me        User
+		Me        *mdb.User
 		CSRFToken string
 		Flash     string
 	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+
+	if err != nil {
+		log.Print(err)
+	}
 }
 
 func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
-	user := User{}
-	uerr := db.Get(&user, "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0", c.URLParams["accountName"])
+	user, uerr := userStore.SelectFromName(c.URLParams["accountName"])
 
 	if uerr != nil {
-		fmt.Println(uerr)
-		return
-	}
-
-	if user.ID == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -450,12 +440,7 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	cerr := db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
-	if cerr != nil {
-		fmt.Println(cerr)
-		return
-	}
+	commentCount := commentStore.SelectCountWhereUserId(user.ID)
 
 	postIDs := []int{}
 	perr := db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
@@ -466,24 +451,8 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 	postCount := len(postIDs)
 
 	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		ccerr := db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if ccerr != nil {
-			fmt.Println(ccerr)
-			return
-		}
+	for _, v := range postIDs {
+		commentedCount += commentStore.SelectCountWherePostId(v)
 	}
 
 	me := getSessionUser(r)
@@ -499,11 +468,11 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		getTemplPath("post.html"),
 	)).Execute(w, struct {
 		Posts          []Post
-		User           User
+		User           *mdb.User
 		PostCount      int
 		CommentCount   int
 		CommentedCount int
-		Me             User
+		Me             *mdb.User
 	}{posts, user, postCount, commentCount, commentedCount, me})
 }
 
@@ -592,7 +561,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 		getTemplPath("post.html"),
 	)).Execute(w, struct {
 		Post Post
-		Me   User
+		Me   *mdb.User
 	}{p, me})
 }
 
@@ -652,12 +621,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	tmpFile, err := ioutil.TempFile("/tmp", "isu-temp")
+	if err != nil {
+		log.Fatal(err)
+	}
+	tmpFile.Write(filedata)
+	tmpFile.Close()
+	filedata = nil
+
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, eerr := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if eerr != nil {
@@ -669,6 +645,16 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	if lerr != nil {
 		fmt.Println(lerr.Error())
 		return
+	}
+	mp := map[string]string{"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
+	ext := mp[mime]
+
+	name := fmt.Sprintf("../public/image/%d.%s", pid, ext)
+	if err := os.Rename(tmpFile.Name(), name); err != nil {
+		log.Print(err)
+	}
+	if err := os.Chmod(name, 0644); err != nil {
+		log.Print(err)
 	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
@@ -695,8 +681,14 @@ func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
+		imgdata, err := ioutil.ReadFile(fmt.Sprintf("../public/image/%d.%s", pid, ext))
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
 		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+		_, err = w.Write(imgdata)
 		if err != nil {
 			fmt.Println(err.Error())
 		}
@@ -724,8 +716,7 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	db.Exec(query, postID, me.ID, r.FormValue("comment"))
+	commentStore.Insert(postID, me.ID, r.FormValue("comment"))
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -742,19 +733,14 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users := []User{}
-	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
+	users := userStore.SelectNonAdmins()
 
 	template.Must(template.ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("banned.html")),
 	).Execute(w, struct {
-		Users     []User
-		Me        User
+		Users     []*mdb.User
+		Me        *mdb.User
 		CSRFToken string
 	}{users, me, getCSRFToken(r)})
 }
@@ -776,12 +762,14 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?"
-
 	r.ParseForm()
-	for _, id := range r.Form["uid[]"] {
-		db.Exec(query, 1, id)
+	strIds := r.Form["uid[]"]
+	ids := []int{}
+	for _, s := range strIds {
+		val, _ := strconv.Atoi(s)
+		ids = append(ids, val)
 	}
+	userStore.DeleteUsers(ids)
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
@@ -824,6 +812,8 @@ func main() {
 	}
 	defer db.Close()
 
+	initMdbs()
+
 	goji.Get("/initialize", getInitialize)
 	goji.Get("/login", getLogin)
 	goji.Post("/login", postLogin)
@@ -839,6 +829,12 @@ func main() {
 	goji.Post("/comment", postComment)
 	goji.Get("/admin/banned", getAdminBanned)
 	goji.Post("/admin/banned", postAdminBanned)
-	// goji.Get("/*", http.FileServer(http.Dir("../public")))
+	if os.Getenv("LOCAL") == "1" {
+		go func() {
+			log.Println(http.ListenAndServe(":6060", nil))
+		}()
+
+		goji.Get("/*", http.FileServer(http.Dir("../public")))
+	}
 	goji.Serve()
 }
