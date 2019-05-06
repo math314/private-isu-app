@@ -2,8 +2,10 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"github.com/zenazn/goji/web/middleware"
 	"html/template"
 	"io"
 	"io/ioutil"
@@ -12,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -33,6 +34,7 @@ var (
 	store        *sessions.CookieStore
 	userStore    *mdb.UserStore
 	commentStore *mdb.CommentStore
+	postStore    *mdb.PostStore
 )
 
 const (
@@ -45,11 +47,7 @@ const (
 )
 
 type Post struct {
-	ID           int       `db:"id"`
-	UserID       int       `db:"user_id"`
-	Body         string    `db:"body"`
-	Mime         string    `db:"mime"`
-	CreatedAt    time.Time `db:"created_at"`
+	mdb.Post
 	CommentCount int
 	Comments     []Comment
 	User         *mdb.User
@@ -75,6 +73,11 @@ func initMdbs() {
 		commentStore.Close()
 	}
 	commentStore = mdb.NewCommentStore(db)
+
+	if postStore != nil {
+		postStore.Close()
+	}
+	postStore = mdb.NewPostStore(db)
 }
 
 func dbInitialize() {
@@ -122,14 +125,8 @@ func escapeshellarg(arg string) string {
 }
 
 func digest(src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		fmt.Println(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
+	out2 := fmt.Sprintf("%x", sha512.Sum512([]byte(src)))
+	return strings.TrimSuffix(string(out2), "\n")
 }
 
 func calculateSalt(accountName string) string {
@@ -176,10 +173,23 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+func makePosts(results []*Post, CSRFToken string, allComments bool) ([]*Post, error) {
+	var posts []*Post
 
-	for _, p := range results {
+	for _, _p := range results {
+		p := *_p
+
+		var perr error
+
+		p.User, perr = userStore.SelectFromId(p.UserID)
+		if perr != nil {
+			return nil, perr
+		}
+
+		if p.User.DelFlg == 1 {
+			continue
+		}
+
 		p.CommentCount = commentStore.SelectCountWherePostId(p.ID)
 
 		limit := -1
@@ -208,18 +218,9 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 		}
 
 		p.Comments = comments
-		var perr error
-
-		p.User, perr = userStore.SelectFromId(p.UserID)
-		if perr != nil {
-			return nil, perr
-		}
-
 		p.CSRFToken = CSRFToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		posts = append(posts, &p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -228,7 +229,7 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 	return posts, nil
 }
 
-func imageURL(p Post) string {
+func imageURL(p *Post) string {
 	ext := ""
 	if p.Mime == "image/jpeg" {
 		ext = ".jpg"
@@ -392,12 +393,11 @@ var indexCache = template.Must(template.New("layout.html").Funcs(template.FuncMa
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
+	results := []*Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 20")
-	if err != nil {
-		fmt.Println(err)
-		return
+	rs := postStore.Select50OrderByCreatedAt()
+	for _, r := range rs {
+		results = append(results, &Post{Post: *r})
 	}
 
 	posts, merr := makePosts(results, getCSRFToken(r), false)
@@ -406,8 +406,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = indexCache.Execute(w, struct {
-		Posts     []Post
+	err := indexCache.Execute(w, struct {
+		Posts     []*Post
 		Me        *mdb.User
 		CSRFToken string
 		Flash     string
@@ -426,12 +426,10 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-
-	rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
-	if rerr != nil {
-		fmt.Println(rerr)
-		return
+	results := []*Post{}
+	rs := postStore.SelectOrderByCreatedAtWhereUserId(user.ID)
+	for _, r := range rs {
+		results = append(results, &Post{Post: *r})
 	}
 
 	posts, merr := makePosts(results, getCSRFToken(r), false)
@@ -443,10 +441,8 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 	commentCount := commentStore.SelectCountWhereUserId(user.ID)
 
 	postIDs := []int{}
-	perr := db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if perr != nil {
-		fmt.Println(perr)
-		return
+	for _, r := range rs {
+		postIDs = append(postIDs, r.ID)
 	}
 	postCount := len(postIDs)
 
@@ -467,7 +463,7 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
 	)).Execute(w, struct {
-		Posts          []Post
+		Posts          []*Post
 		User           *mdb.User
 		PostCount      int
 		CommentCount   int
@@ -494,17 +490,20 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-	rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601_FORMAT))
-	if rerr != nil {
-		fmt.Println(rerr)
-		return
+	results := []*Post{}
+	rs := postStore.SelectOrderByCreatedAtWhereCreatedAt(t)
+	for _, r := range rs {
+		results = append(results, &Post{Post: *r})
 	}
 
 	posts, merr := makePosts(results, getCSRFToken(r), false)
 	if merr != nil {
 		fmt.Println(merr)
 		return
+	}
+
+	if len(posts) != postsPerPage {
+		log.Print("not enough")
 	}
 
 	if len(posts) == 0 {
@@ -529,11 +528,10 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
-	rerr := db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if rerr != nil {
-		fmt.Println(rerr)
-		return
+	results := []*Post{}
+	rs := postStore.SelectById(pid)
+	for _, r := range rs {
+		results = append(results, &Post{Post: *r})
 	}
 
 	posts, merr := makePosts(results, getCSRFToken(r), true)
@@ -560,7 +558,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 		getTemplPath("post_id.html"),
 		getTemplPath("post.html"),
 	)).Execute(w, struct {
-		Post Post
+		Post *Post
 		Me   *mdb.User
 	}{p, me})
 }
@@ -621,43 +619,18 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpFile, err := ioutil.TempFile("/tmp", "isu-temp")
-	if err != nil {
-		log.Fatal(err)
-	}
-	tmpFile.Write(filedata)
-	tmpFile.Close()
-	filedata = nil
+	pid := postStore.Insert(me.ID, mime, r.FormValue("body"))
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
-	result, eerr := db.Exec(
-		query,
-		me.ID,
-		mime,
-		r.FormValue("body"),
-	)
-	if eerr != nil {
-		fmt.Println(eerr.Error())
-		return
-	}
-
-	pid, lerr := result.LastInsertId()
-	if lerr != nil {
-		fmt.Println(lerr.Error())
-		return
-	}
 	mp := map[string]string{"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif"}
 	ext := mp[mime]
 
 	name := fmt.Sprintf("../public/image/%d.%s", pid, ext)
-	if err := os.Rename(tmpFile.Name(), name); err != nil {
+	if err := ioutil.WriteFile(name, filedata, 0644); err != nil {
 		log.Print(err)
 	}
-	if err := os.Chmod(name, 0644); err != nil {
-		log.Print(err)
-	}
+	filedata = nil
 
-	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
+	http.Redirect(w, r, "/posts/"+strconv.Itoa(pid), http.StatusFound)
 	return
 }
 
@@ -669,13 +642,8 @@ func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	derr := db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if derr != nil {
-		fmt.Println(derr.Error())
-		return
-	}
-
+	rs := postStore.SelectById(pid)
+	post := &Post{Post: *rs[0]}
 	ext := c.URLParams["ext"]
 
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
@@ -830,11 +798,13 @@ func main() {
 	goji.Get("/admin/banned", getAdminBanned)
 	goji.Post("/admin/banned", postAdminBanned)
 	if os.Getenv("LOCAL") == "1" {
-		go func() {
-			log.Println(http.ListenAndServe(":6060", nil))
-		}()
-
 		goji.Get("/*", http.FileServer(http.Dir("../public")))
 	}
+	go func() {
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
+
+	goji.Abandon(middleware.Logger)
+
 	goji.Serve()
 }

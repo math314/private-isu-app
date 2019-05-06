@@ -71,3 +71,19 @@ func (s *IntIndex) Insert(val int, pk int) {
 func (s *IntIndex) SelectPKs(val int) []int {
 	return s.valToPKs[val]
 }
+
+type Int64Index struct {
+	valToPKs map[int64][]int
+}
+
+func NewInt64Index() *Int64Index {
+	return &Int64Index{map[int64][]int{}}
+}
+
+func (s *Int64Index) Insert(val int64, pk int) {
+	s.valToPKs[val] = append(s.valToPKs[val], pk)
+}
+
+func (s *Int64Index) SelectPKs(val int64) []int {
+	return s.valToPKs[val]
+}
